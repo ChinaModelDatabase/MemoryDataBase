@@ -1,0 +1,20 @@
+[package]
+name = "jx-crypto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+rand.workspace = true
+hex.workspace = true
+tracing.workspace = true
+sm3.workspace = true
+sm4.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+sm4-gcm = "0.1"
+base64 = "0.22"
+gm-tlcp = "0.7"
+gm-crypto = "0.3"

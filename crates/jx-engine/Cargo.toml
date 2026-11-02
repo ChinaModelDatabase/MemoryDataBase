@@ -1,0 +1,14 @@
+[package]
+name = "jx-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+jx-proto = { path = "../jx-proto" }

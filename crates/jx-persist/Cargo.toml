@@ -1,0 +1,18 @@
+[package]
+name = "jx-persist"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+rand.workspace = true
+anyhow.workspace = true
+jx-engine = { path = "../jx-engine" }
+jx-crypto = { path = "../jx-crypto" }
+jx-proto = { path = "../jx-proto" }
+
+[dev-dependencies]

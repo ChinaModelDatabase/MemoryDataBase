@@ -1,0 +1,41 @@
+bind 0.0.0.0
+port 6379
+tls-mode plain
+# tls-mode tlcp
+# tlcp-sign-cert /etc/MemoryDataBase/tlcp/sign.crt
+# tlcp-sign-key  /etc/MemoryDataBase/tlcp/sign.key
+# tlcp-enc-cert  /etc/MemoryDataBase/tlcp/enc.crt
+# tlcp-enc-key   /etc/MemoryDataBase/tlcp/enc.key
+# tlcp-ca        /etc/MemoryDataBase/tlcp/ca.crt
+shards 0
+maxmemory 1gb
+maxmemory-policy allkeys-lru
+dir /var/lib/MemoryDataBase
+save 900 1
+save 300 10
+appendonly no
+appendfsync everysec
+# storage-key-file /etc/MemoryDataBase/storage.key
+# requirepass-sm3 <hex lowercase of sm3(password)>  # MVP: unsalted SM3(password) hex
+maxclients 10000
+timeout 0
+loglevel info
+
+# --- Replication (see docs/superpowers/ha/replication-runbook.md) ---
+# role: standalone (default) | master | replica
+# role master        # 本节点为主：监听 repl-port，写 tee 到 backlog，FULLRESYNC 发 RDB 快照
+# role replica       # 本节点为从：客户端写返回 READONLY；配合 replicaof 使用
+# repl-port 6380     # 复制监听端口；不配置时默认 port + 1（replicaof 里填 master 的 client port，
+#                    # 连接时自动 +1；INFO replication 的 master_repl_port 可查看实际绑定端口）
+# backlog-size 64mb  # 复制 backlog 环形缓冲
+# repl-timeout 60    # 复制超时（秒）
+# replicaof 127.0.0.1 6379   # role replica 时指向 master 的 client port（非 repl-port）
+# masterauth <password>      # 连接 master repl-port 的 AUTH 口令（对应 master requirepass-sm3）
+# 注意：master 与 replica 的 shards 必须一致，否则 FULLRESYNC RDB 无法加载。
+# 切换：REPLICAOF NO ONE 提升为 master（详见 runbook；有双主风险，旧 master 需先降级）。
+
+# --- Slowlog (latency tracking) ---
+# slowlog-log-slower-than: execution time threshold in microseconds (0 disables)
+slowlog-log-slower-than 10000
+# slowlog-max-len: maximum number of entries in slowlog ring buffer
+slowlog-max-len 128
