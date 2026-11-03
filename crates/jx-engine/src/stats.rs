@@ -76,6 +76,27 @@ pub fn record_rdb_save(duration_ms: u64) {
         .store(duration_ms, Ordering::Relaxed);
 }
 
+/// Render the `# Persistence` INFO section lines (no header).
+pub fn info_persistence_section(appendonly: bool, persistence_enabled: bool) -> Vec<String> {
+    vec![
+        "loading:0".to_string(),
+        format!("aof_enabled:{}", u8::from(appendonly)),
+        format!("aof_rewrite_in_progress:0"),
+        format!(
+            "aof_last_write_status:{}",
+            if persistence_enabled { "ok" } else { "n/a" }
+        ),
+        format!("rdb_bgsave_in_progress:0"),
+        format!("rdb_changes_since_last_save:0"),
+        format!("rdb_saves:{}", STATS.rdb_saves.load(Ordering::Relaxed)),
+        format!(
+            "rdb_last_save_ms:{}",
+            STATS.rdb_saves_ms_last.load(Ordering::Relaxed)
+        ),
+        format!("rdb_last_bgsave_status:ok"),
+    ]
+}
+
 /// Render the `# Stats` INFO section (trailing \r\n included).
 pub fn info_stats_section() -> String {
     let s = &STATS;

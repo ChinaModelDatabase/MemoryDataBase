@@ -30,6 +30,8 @@ pub struct ConfigRuntime {
     /// Idle replication-stream timeout (seconds) passed into dynamic
     /// `REPLICAOF` replica spawns.
     pub repl_timeout_secs: u64,
+    /// Transport mode in effect for this listener (INFO security).
+    pub tls_mode: TlsMode,
     /// Slowlog threshold in microseconds (0 disables).
     pub slowlog_log_slower_than: i64,
     /// Slowlog ring buffer capacity.
@@ -52,6 +54,7 @@ impl ConfigRuntime {
             repl_backlog_size: cfg.backlog_size,
             bind: cfg.bind.clone(),
             repl_timeout_secs: cfg.repl_timeout_secs,
+            tls_mode: cfg.tls_mode,
             slowlog_log_slower_than: cfg.slowlog_log_slower_than,
             slowlog_max_len: cfg.slowlog_max_len,
             slowlog: std::sync::Arc::new(crate::slowlog::Slowlog::new(
@@ -78,6 +81,18 @@ pub struct TlcpPaths {
     pub enc_cert: PathBuf,
     pub enc_key: PathBuf,
     pub ca: PathBuf,
+    /// SM2 signature distid policy for client chain verification.
+    pub distid_policy: TlcpDistidPolicy,
+}
+
+/// How strictly SM2 certificate signatures are verified on TLCP handshakes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlcpDistidPolicy {
+    /// GM/T standard distid only (fail-closed).
+    #[default]
+    Strict,
+    /// Also accept the empty distid used by OpenSSL 3.x-issued certs.
+    PermissiveOpenSsl,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -200,6 +215,13 @@ pub fn load_config(path: &Path) -> Result<Config> {
                 cfg.tlcp.get_or_insert_with(Default::default).enc_key = PathBuf::from(v)
             }
             "tlcp-ca" => cfg.tlcp.get_or_insert_with(Default::default).ca = PathBuf::from(v),
+            "tlcp-distid-policy" => {
+                cfg.tlcp.get_or_insert_with(Default::default).distid_policy = match v {
+                    "strict" => TlcpDistidPolicy::Strict,
+                    "permissive" => TlcpDistidPolicy::PermissiveOpenSsl,
+                    other => bail!("bad tlcp-distid-policy {other} (strict|permissive)"),
+                }
+            }
             "tls-cert" => cfg.tls.get_or_insert_with(Default::default).cert = PathBuf::from(v),
             "tls-key" => cfg.tls.get_or_insert_with(Default::default).key = PathBuf::from(v),
             "maxclients" => cfg.maxclients = v.parse()?,

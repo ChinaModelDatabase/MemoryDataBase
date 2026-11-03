@@ -7,6 +7,11 @@ pub enum RespValue {
     Integer(i64),
     BulkString(Option<Bytes>),
     Array(Option<Vec<RespValue>>),
+    /// RESP3 map (`%`): alternating key/value entries, used by HELLO when a
+    /// client negotiates protocol version 3.
+    Map(Vec<(RespValue, RespValue)>),
+    /// RESP3 null (`_`); RESP2 connections keep using null bulk (`$-1`).
+    Null,
 }
 
 impl RespValue {
@@ -30,5 +35,11 @@ impl RespValue {
     }
     pub fn null_array() -> Self {
         RespValue::Array(None)
+    }
+    pub fn map(entries: Vec<(RespValue, RespValue)>) -> Self {
+        RespValue::Map(entries)
+    }
+    pub fn null() -> Self {
+        RespValue::Null
     }
 }

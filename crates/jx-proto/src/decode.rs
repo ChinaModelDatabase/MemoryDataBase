@@ -22,10 +22,23 @@ impl RespDecoder {
     }
 
     pub fn next_value(&mut self) -> Result<Option<RespValue>, DecodeError> {
-        if self.consumed >= self.buf.len() {
-            self.buf.clear();
-            self.consumed = 0;
-            return Ok(None);
+        loop {
+            if self.consumed >= self.buf.len() {
+                self.buf.clear();
+                self.consumed = 0;
+                return Ok(None);
+            }
+            // Inline clients (telnet, redis-cli --pipe) emit stray blank lines
+            // between commands; drop them instead of treating them as input.
+            if self.buf[self.consumed..].starts_with(b"\r\n") {
+                self.consumed += 2;
+                continue;
+            }
+            if self.buf[self.consumed..].starts_with(b"\n") {
+                self.consumed += 1;
+                continue;
+            }
+            break;
         }
         match try_parse(&self.buf[self.consumed..])? {
             Some((value, n)) => {
@@ -58,6 +71,19 @@ fn read_line(buf: &[u8]) -> Result<Option<(Bytes, usize)>, DecodeError> {
         return Err(DecodeError);
     }
     Ok(Some((Bytes::copy_from_slice(&buf[..pos - 1]), pos + 1)))
+}
+
+/// Like `read_line` but tolerates a missing CR (inline-only leniency).
+fn read_line_lenient(buf: &[u8]) -> Result<Option<(Bytes, usize)>, DecodeError> {
+    let Some(pos) = buf.iter().position(|&b| b == b'\n') else {
+        return Ok(None);
+    };
+    let end = if pos > 0 && buf[pos - 1] == b'\r' {
+        pos - 1
+    } else {
+        pos
+    };
+    Ok(Some((Bytes::copy_from_slice(&buf[..end]), pos + 1)))
 }
 
 fn parse_len(line: &[u8]) -> Result<Option<usize>, DecodeError> {
@@ -137,6 +163,31 @@ fn try_parse(buf: &[u8]) -> Result<Option<(RespValue, usize)>, DecodeError> {
             }
             Ok(Some((RespValue::Array(Some(items)), pos)))
         }
-        _ => Err(DecodeError),
+        _ => {
+            // RESP2 inline command: a bare line of whitespace-separated args.
+            // Redis trims an optional CR, so LF-only lines (redis-cli --pipe
+            // on LF-terminated files) are accepted too.
+            let Some((line, used)) = read_line_lenient(buf)? else {
+                return Ok(None);
+            };
+            if line.len() > MAX_BULK_LEN {
+                return Err(DecodeError);
+            }
+            let mut items = Vec::new();
+            let mut start: Option<usize> = None;
+            for (i, &c) in line.iter().enumerate() {
+                if c == b' ' || c == b'\t' {
+                    if let Some(s) = start.take() {
+                        items.push(RespValue::bulk(Bytes::copy_from_slice(&line[s..i])));
+                    }
+                } else if start.is_none() {
+                    start = Some(i);
+                }
+            }
+            if let Some(s) = start {
+                items.push(RespValue::bulk(Bytes::copy_from_slice(&line[s..])));
+            }
+            Ok(Some((RespValue::Array(Some(items)), used)))
+        }
     }
 }

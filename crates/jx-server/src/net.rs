@@ -1,5 +1,5 @@
 use crate::background;
-use crate::config::{Config, ConfigRuntime, Role, TlsMode};
+use crate::config::{Config, ConfigRuntime, Role, TlcpDistidPolicy, TlsMode};
 use crate::conn;
 use crate::persistence_cmd::PersistenceCtx;
 use crate::repl::master::spawn_master_repl;
@@ -124,7 +124,11 @@ fn build_tlcp_acceptor(cfg: &Config) -> Result<jx_crypto::TlcpAcceptor> {
         &t.enc_key,
         &t.ca,
     )?;
-    jx_crypto::TlcpAcceptor::from_config(&tlcp_cfg)
+    let policy = match t.distid_policy {
+        TlcpDistidPolicy::Strict => jx_crypto::TlcpDistidPolicy::Strict,
+        TlcpDistidPolicy::PermissiveOpenSsl => jx_crypto::TlcpDistidPolicy::PermissiveOpenSsl,
+    };
+    jx_crypto::TlcpAcceptor::from_config_with_policy(&tlcp_cfg, policy)
 }
 
 /// Run the server until a shutdown signal (SIGINT/SIGTERM) or fatal accept

@@ -84,6 +84,25 @@ pub fn pem_cert_to_der(pem: &[u8], label: &str) -> Result<Vec<u8>> {
         .with_context(|| format!("{label}: base64 decode cert"))
 }
 
+/// Decode every PEM CERTIFICATE block to DER (a CA bundle may hold several).
+pub fn pem_certs_to_der(pem: &[u8], label: &str) -> Result<Vec<Vec<u8>>> {
+    let text = std::str::from_utf8(pem).with_context(|| format!("{label} pem utf-8"))?;
+    let mut search = 0usize;
+    let mut out = Vec::new();
+    let begin = "-----BEGIN CERTIFICATE-----";
+    let end = "-----END CERTIFICATE-----";
+    while let Some(rel_start) = text[search..].find(begin) {
+        let start = search + rel_start;
+        let Some(rel_end) = text[start..].find(end) else {
+            break;
+        };
+        let stop = start + rel_end + end.len();
+        out.push(pem_cert_to_der(&text.as_bytes()[start..stop], label)?);
+        search = stop;
+    }
+    Ok(out)
+}
+
 /// Parse an unencrypted SM2 private key PEM (SEC1 or PKCS#8).
 ///
 /// Password-encrypted keys are rejected: MVP accepts only unencrypted keys.
@@ -138,6 +157,18 @@ fn extract_private_key_pem(text: &str) -> &str {
     text
 }
 
+/// SM2 signature distid policy used when verifying client certificate chains.
+///
+/// `Strict` accepts only the GM/T standard distid; `PermissiveOpenSsl` also
+/// accepts the empty distid that OpenSSL 3.x uses when signing SM2 certs
+/// (needed for certs issued outside GmSSL, weaker by design).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TlcpDistidPolicy {
+    #[default]
+    Strict,
+    PermissiveOpenSsl,
+}
+
 /// TLCP server acceptor wrapping gm-tlcp's dual-certificate acceptor.
 pub struct TlcpAcceptor {
     inner: gm_tlcp::TlcpAcceptor,
@@ -146,10 +177,14 @@ pub struct TlcpAcceptor {
 impl TlcpAcceptor {
     /// Build a production dual-cert acceptor from PEM config.
     ///
-    /// CA PEM is retained on [`TlcpConfig`] for future client-auth chain
-    /// validation (`with_client_ca_chain`); it is not required by the
-    /// current acceptor handshake path.
+    /// The CA PEM becomes the client-certificate trust anchor set, so only
+    /// client chains rooted in that CA complete the handshake.
     pub fn from_config(cfg: &TlcpConfig) -> Result<Self> {
+        Self::from_config_with_policy(cfg, TlcpDistidPolicy::default())
+    }
+
+    /// Same as [`TlcpAcceptor::from_config`] with an explicit distid policy.
+    pub fn from_config_with_policy(cfg: &TlcpConfig, policy: TlcpDistidPolicy) -> Result<Self> {
         if !tlcp_enabled_and_ready(cfg) {
             anyhow::bail!("TLCP config incomplete: need sign/enc cert+key and ca PEMs");
         }
@@ -157,8 +192,26 @@ impl TlcpAcceptor {
         let enc_der = pem_cert_to_der(&cfg.enc_cert_pem, "enc cert")?;
         let sign_key = parse_sm2_key(&cfg.sign_key_pem, "sign key")?;
         let enc_key = parse_sm2_key(&cfg.enc_key_pem, "enc key")?;
-        let inner =
-            gm_tlcp::TlcpAcceptor::new().with_dual_certs(sign_der, enc_der, sign_key, enc_key);
+        let anchors = pem_certs_to_der(&cfg.ca_pem, "ca cert")?;
+        let gm_policy = match policy {
+            TlcpDistidPolicy::Strict => gm_crypto::x509::verify::DistidPolicy::Strict,
+            TlcpDistidPolicy::PermissiveOpenSsl => {
+                gm_crypto::x509::verify::DistidPolicy::Permissive {
+                    fallback_distids: vec![String::new()],
+                    audit_on_fallback: Some(std::sync::Arc::new(|distid: &str| {
+                        tracing::warn!(
+                            "TLCP client cert verified with non-standard SM2 distid \
+                             (len {}); issue certs from a GmSSL-conformant CA if possible",
+                            distid.len()
+                        );
+                    })),
+                }
+            }
+        };
+        let inner = gm_tlcp::TlcpAcceptor::new()
+            .with_dual_certs(sign_der, enc_der, sign_key, enc_key)
+            .with_client_ca_chain(anchors)
+            .with_distid_policy(gm_policy);
         Ok(Self { inner })
     }
 

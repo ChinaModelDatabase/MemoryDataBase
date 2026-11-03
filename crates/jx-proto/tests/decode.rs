@@ -49,9 +49,118 @@ fn decode_null_bulk_and_array() {
 }
 
 #[test]
-fn decode_rejects_unknown_type() {
+fn decode_inline_ping_to_array() {
     let mut d = RespDecoder::new();
-    d.feed(b"?\r\n");
+    d.feed(b"PING\r\n");
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![RespValue::bulk(Bytes::from_static(
+            b"PING"
+        ))]))
+    );
+}
+
+#[test]
+fn decode_inline_multiple_commands() {
+    let mut d = RespDecoder::new();
+    d.feed(b"SET foo bar\r\nGET foo\r\n");
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![
+            RespValue::bulk(Bytes::from_static(b"SET")),
+            RespValue::bulk(Bytes::from_static(b"foo")),
+            RespValue::bulk(Bytes::from_static(b"bar")),
+        ]))
+    );
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![
+            RespValue::bulk(Bytes::from_static(b"GET")),
+            RespValue::bulk(Bytes::from_static(b"foo")),
+        ]))
+    );
+    assert!(d.next_value().unwrap().is_none());
+}
+
+#[test]
+fn decode_inline_partial_line_waits_for_crlf() {
+    let mut d = RespDecoder::new();
+    d.feed(b"PIN");
+    assert!(d.next_value().unwrap().is_none());
+    d.feed(b"G\r\n");
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![RespValue::bulk(Bytes::from_static(
+            b"PING"
+        ))]))
+    );
+}
+
+#[test]
+fn decode_inline_accepts_lf_only_line() {
+    let mut d = RespDecoder::new();
+    d.feed(b"SET lf v\nGET lf\n");
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![
+            RespValue::bulk(Bytes::from_static(b"SET")),
+            RespValue::bulk(Bytes::from_static(b"lf")),
+            RespValue::bulk(Bytes::from_static(b"v")),
+        ]))
+    );
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![
+            RespValue::bulk(Bytes::from_static(b"GET")),
+            RespValue::bulk(Bytes::from_static(b"lf")),
+        ]))
+    );
+    assert!(d.next_value().unwrap().is_none());
+}
+
+#[test]
+fn decode_inline_skips_empty_lines() {
+    let mut d = RespDecoder::new();
+    d.feed(b"\r\n\r\nPING\r\n");
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![RespValue::bulk(Bytes::from_static(
+            b"PING"
+        ))]))
+    );
+}
+
+#[test]
+fn decode_inline_collapses_runs_of_spaces() {
+    let mut d = RespDecoder::new();
+    d.feed(b"SET   foo   bar\r\n");
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![
+            RespValue::bulk(Bytes::from_static(b"SET")),
+            RespValue::bulk(Bytes::from_static(b"foo")),
+            RespValue::bulk(Bytes::from_static(b"bar")),
+        ]))
+    );
+}
+
+#[test]
+fn decode_inline_following_array_command() {
+    let mut d = RespDecoder::new();
+    d.feed(b"*1\r\n$4\r\nPING\r\nPING\r\n");
+    assert!(matches!(d.next_value().unwrap(), Some(RespValue::Array(_))));
+    assert_eq!(
+        d.next_value().unwrap(),
+        Some(RespValue::array(vec![RespValue::bulk(Bytes::from_static(
+            b"PING"
+        ))]))
+    );
+}
+
+#[test]
+fn decode_rejects_typed_frame_without_cr() {
+    let mut d = RespDecoder::new();
+    d.feed(b":42\n");
     assert!(d.next_value().is_err());
 }
 

@@ -172,12 +172,41 @@ pub fn zcard(sh: &mut ShardState, args: &[Bytes], now: u64) -> Result<RespValue,
     }
 }
 
-pub fn zrange(sh: &mut ShardState, args: &[Bytes], now: u64) -> Result<RespValue, RespValue> {
-    if args.len() != 3 {
-        return Err(RespValue::err(
-            "ERR wrong number of arguments for 'zrange' command",
-        ));
+fn eq_ignore_ascii_case(b: &Bytes, s: &str) -> bool {
+    std::str::from_utf8(b)
+        .map(|v| v.eq_ignore_ascii_case(s))
+        .unwrap_or(false)
+}
+
+/// Build the reply for sorted-set members: `member` only, or
+/// `member, score` pairs when `WITHSCORES` was requested.
+fn encode_members(items: Vec<(Bytes, f64)>, withscores: bool) -> Vec<RespValue> {
+    let mut out = Vec::new();
+    for (m, s) in items {
+        out.push(RespValue::bulk(m));
+        if withscores {
+            out.push(RespValue::bulk(Bytes::from(fmt_f64(s))));
+        }
     }
+    out
+}
+
+pub fn zrange(sh: &mut ShardState, args: &[Bytes], now: u64) -> Result<RespValue, RespValue> {
+    let withscores = if args.len() == 4 {
+        if !eq_ignore_ascii_case(&args[3], "WITHSCORES") {
+            return Err(RespValue::err(
+                "ERR wrong number of arguments for 'zrange' command",
+            ));
+        }
+        true
+    } else {
+        if args.len() != 3 {
+            return Err(RespValue::err(
+                "ERR wrong number of arguments for 'zrange' command",
+            ));
+        }
+        false
+    };
     let start = parse_i64(&args[1])?;
     let stop = parse_i64(&args[2])?;
     if !sh.touch_alive(&args[0], now) {
@@ -200,14 +229,12 @@ pub fn zrange(sh: &mut ShardState, args: &[Bytes], now: u64) -> Result<RespValue
             if s > t {
                 return Ok(RespValue::array(vec![]));
             }
-            Ok(RespValue::array(
-                items
-                    .into_iter()
-                    .skip(s as usize)
-                    .take((t - s + 1) as usize)
-                    .map(|(m, _)| RespValue::bulk(m))
-                    .collect(),
-            ))
+            let window: Vec<(Bytes, f64)> = items
+                .into_iter()
+                .skip(s as usize)
+                .take((t - s + 1) as usize)
+                .collect();
+            Ok(RespValue::array(encode_members(window, withscores)))
         }
         _ => Err(wrongtype()),
     }
@@ -228,26 +255,49 @@ pub fn zrangebyscore(
     args: &[Bytes],
     now: u64,
 ) -> Result<RespValue, RespValue> {
-    if args.len() != 4 {
+    if args.len() < 3 {
         return Err(RespValue::err(
             "ERR wrong number of arguments for 'zrangebyscore' command",
         ));
     }
     let min = parse_score_bound(&args[1])?;
     let max = parse_score_bound(&args[2])?;
+    let mut withscores = false;
+    let mut limit: Option<(usize, i64)> = None;
+    let mut i = 3;
+    while i < args.len() {
+        if eq_ignore_ascii_case(&args[i], "WITHSCORES") {
+            withscores = true;
+            i += 1;
+        } else if eq_ignore_ascii_case(&args[i], "LIMIT") {
+            if i + 2 >= args.len() {
+                return Err(RespValue::err("ERR syntax error"));
+            }
+            let offset = parse_i64(&args[i + 1])?.max(0) as usize;
+            let count = parse_i64(&args[i + 2])?;
+            limit = Some((offset, count));
+            i += 3;
+        } else {
+            return Err(RespValue::err("ERR syntax error"));
+        }
+    }
     if !sh.touch_alive(&args[0], now) {
         return Ok(RespValue::array(vec![]));
     }
     match &sh.dict[&args[0]].value {
         JxValue::ZSet(z) => {
-            let items: Vec<(Bytes, f64)> = sorted_members(&z.entries)
+            let mut items: Vec<(Bytes, f64)> = sorted_members(&z.entries)
                 .into_iter()
                 .filter(|(_, s)| min.map(|lo| *s >= lo).unwrap_or(true))
                 .filter(|(_, s)| max.map(|hi| *s <= hi).unwrap_or(true))
                 .collect();
-            Ok(RespValue::array(
-                items.into_iter().map(|(m, _)| RespValue::bulk(m)).collect(),
-            ))
+            if let Some((offset, count)) = limit {
+                items = items.into_iter().skip(offset).collect();
+                if count >= 0 {
+                    items.truncate(count as usize);
+                }
+            }
+            Ok(RespValue::array(encode_members(items, withscores)))
         }
         _ => Err(wrongtype()),
     }

@@ -7,6 +7,8 @@ tls-mode plain
 # tlcp-enc-cert  /etc/MemoryDataBase/tlcp/enc.crt
 # tlcp-enc-key   /etc/MemoryDataBase/tlcp/enc.key
 # tlcp-ca        /etc/MemoryDataBase/tlcp/ca.crt
+# tlcp-distid-policy permissive   # strict (default, GM/T distid only) | permissive
+#                                 # (also accept the empty distid used by OpenSSL 3.x SM2 certs)
 shards 0
 maxmemory 1gb
 maxmemory-policy allkeys-lru

@@ -35,6 +35,16 @@ pub fn encode(value: &RespValue, out: &mut BytesMut) {
                 encode(it, out);
             }
         }
+        RespValue::Null => out.put_slice(b"_\r\n"),
+        RespValue::Map(entries) => {
+            out.put_u8(b'%');
+            out.put_slice(entries.len().to_string().as_bytes());
+            out.put_slice(b"\r\n");
+            for (k, v) in entries {
+                encode(k, out);
+                encode(v, out);
+            }
+        }
     }
 }
 

@@ -66,7 +66,9 @@ impl Slowlog {
             let c = self.config.lock().unwrap_or_else(|p| p.into_inner());
             (c.log_slower_than, c.max_len)
         };
-        if threshold <= 0 || duration_us < threshold {
+        // Redis semantics: a negative threshold disables logging, zero logs
+        // every command.
+        if threshold < 0 || duration_us < threshold {
             return;
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);

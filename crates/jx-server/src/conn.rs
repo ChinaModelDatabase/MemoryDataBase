@@ -1,4 +1,4 @@
-use crate::config::{ConfigRuntime, Role};
+use crate::config::{ConfigRuntime, Role, TlsMode};
 use crate::dispatch;
 use crate::persistence_cmd::{self, PersistenceCtx};
 use crate::repl::{self, ReplHandle};
@@ -27,6 +27,10 @@ where
     let mut buf = vec![0u8; 16 * 1024];
     // Auth gate uses the live password from ConfigRuntime.
     let mut authed = runtime.read().unwrap().requirepass_sm3.is_none();
+    // Set when a client negotiates RESP3 via `HELLO 3`; replies are then
+    // reshaped to RESP3 (null `_`, maps, WITHSCORES pairs) for that
+    // connection only.
+    let mut proto3 = false;
     // Reused across reads: pipeline responses encode into one buffer, one write.
     let mut out = bytes::BytesMut::with_capacity(8 * 1024);
     loop {
@@ -59,6 +63,10 @@ where
                 for args in cmds {
                     let (resp, q) =
                         run_command(args.clone(), &rt, &runtime, &pctx, &repl, &mut authed).await;
+                    if matches!(resp, RespValue::Map(_)) {
+                        proto3 = true;
+                    }
+                    let resp = if proto3 { to_resp3(&args, resp) } else { resp };
                     if matches!(resp, RespValue::Error(_)) {
                         jx_engine::stats::inc(&jx_engine::stats::STATS.cmd_errors);
                     } else {
@@ -104,6 +112,78 @@ where
         }
     }
     Ok(())
+}
+
+/// Reshape a RESP2 reply into the RESP3 form clients expect once they
+/// negotiated protocol 3 (otherwise default modern clients misparse nulls,
+/// maps and WITHSCORES pairs).
+fn to_resp3(args: &[Bytes], resp: RespValue) -> RespValue {
+    fn nulls(v: RespValue) -> RespValue {
+        match v {
+            RespValue::BulkString(None) => RespValue::null(),
+            RespValue::Array(Some(items)) => {
+                RespValue::array(items.into_iter().map(nulls).collect())
+            }
+            RespValue::Map(entries) => RespValue::map(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (nulls(k), nulls(v)))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    fn pairs(v: RespValue) -> RespValue {
+        match v {
+            RespValue::Array(Some(items)) => RespValue::array(
+                items
+                    .chunks(2)
+                    .map(|c| {
+                        RespValue::array(vec![
+                            c[0].clone(),
+                            c.get(1).cloned().unwrap_or(RespValue::null()),
+                        ])
+                    })
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    fn map_of(v: RespValue) -> RespValue {
+        match v {
+            RespValue::Array(Some(items)) => RespValue::map(
+                items
+                    .chunks(2)
+                    .map(|c| (c[0].clone(), c.get(1).cloned().unwrap_or(RespValue::null())))
+                    .collect(),
+            ),
+            other => other,
+        }
+    }
+    let name = args
+        .first()
+        .map(|n| String::from_utf8_lossy(n).to_ascii_uppercase())
+        .unwrap_or_default();
+    let v = nulls(resp);
+    match name.as_str() {
+        "HGETALL" => map_of(v),
+        "CONFIG"
+            if args
+                .get(1)
+                .map(|s| s.as_ref().eq_ignore_ascii_case(b"GET"))
+                .unwrap_or(false) =>
+        {
+            map_of(v)
+        }
+        "ZRANGE" | "ZRANGEBYSCORE"
+            if args
+                .iter()
+                .any(|a| a.as_ref().eq_ignore_ascii_case(b"WITHSCORES")) =>
+        {
+            pairs(v)
+        }
+        _ => v,
+    }
 }
 
 fn extract_args(v: RespValue) -> Vec<Bytes> {
@@ -174,6 +254,9 @@ async fn run_command(
         };
         return (resp, false);
     }
+    if name == "HELLO" {
+        return (hello_command(&args, runtime, authed), false);
+    }
     if !*authed {
         return (RespValue::err("NOAUTH Authentication required."), false);
     }
@@ -234,7 +317,8 @@ async fn run_command(
         replicaof_command(rt, runtime, repl, &args)
     } else if name == "INFO" {
         let base = dispatch::dispatch(rt, args.clone());
-        append_replication_info(base, runtime, repl)
+        let full = append_replication_info(base, runtime, repl);
+        finish_info(full, &args, rt, runtime, pctx)
     } else if let Some(ctx) = pctx {
         // SAVE/BGSAVE/LASTSAVE/BGREWRITEAOF are intercepted
         // here (conn layer) so the engine stays persist-free.
@@ -269,6 +353,105 @@ async fn run_command(
         handle.record(&slow_args, elapsed);
     }
     (resp, false)
+}
+
+/// RESP2 `HELLO [protover] [AUTH user pass] [SETNAME name]`.
+///
+/// Clients (redis-py, RESP handshake) open with HELLO; refusing it makes
+/// mainstream clients unusable. Only protocol version 2 is offered, so the
+/// reply stays a RESP2 map (flat array of alternating field/value). HELLO is
+/// allowed before AUTH so `HELLO ... AUTH ...` can authenticate.
+fn hello_command(
+    args: &[Bytes],
+    runtime: &Arc<RwLock<ConfigRuntime>>,
+    authed: &mut bool,
+) -> RespValue {
+    let mut proto = 2i64;
+    let mut i = 1;
+    if let Some(first) = args.get(1) {
+        if let Ok(v) = String::from_utf8_lossy(first).parse::<i64>() {
+            if v != 2 && v != 3 {
+                return RespValue::err("NOPROTO unsupported protocol version");
+            }
+            proto = v;
+            i = 2;
+        }
+    }
+    while i < args.len() {
+        let opt = String::from_utf8_lossy(&args[i]).to_ascii_uppercase();
+        match opt.as_str() {
+            "AUTH" => {
+                let Some(pass) = args.get(i + 2) else {
+                    return RespValue::err("ERR syntax error");
+                };
+                let expected = runtime.read().unwrap().requirepass_sm3.clone();
+                let Some(expected) = expected else {
+                    return RespValue::err("ERR Client sent AUTH, but no password is set.");
+                };
+                let pass = String::from_utf8_lossy(pass);
+                if !verify_requirepass(&expected, &pass) {
+                    jx_engine::stats::inc(&jx_engine::stats::STATS.rejected_connections);
+                    return RespValue::err("WRONGPASS invalid username-password pair");
+                }
+                *authed = true;
+                i += 3;
+            }
+            "SETNAME" => {
+                if args.get(i + 1).is_none() {
+                    return RespValue::err("ERR syntax error");
+                }
+                i += 2;
+            }
+            _ => return RespValue::err("ERR syntax error"),
+        }
+    }
+    let role = match runtime.read().unwrap().role {
+        Role::Replica => "replica",
+        _ => "master",
+    };
+    // RESP3 is accepted so default modern clients (redis-py >= 5 sends
+    // `HELLO 3`) can connect; the map is emitted in RESP3 form but the
+    // connection keeps speaking RESP2 types afterwards.
+    let fields: Vec<(Bytes, RespValue)> = vec![
+        (
+            Bytes::from_static(b"server"),
+            RespValue::bulk(Bytes::from_static(b"MemoryDataBase")),
+        ),
+        (
+            Bytes::from_static(b"version"),
+            RespValue::bulk(Bytes::from_static(b"0.1.0")),
+        ),
+        (Bytes::from_static(b"proto"), RespValue::int(proto)),
+        (Bytes::from_static(b"id"), RespValue::int(next_conn_id())),
+        (
+            Bytes::from_static(b"mode"),
+            RespValue::bulk(Bytes::from_static(b"standalone")),
+        ),
+        (
+            Bytes::from_static(b"role"),
+            RespValue::bulk(Bytes::from(role.as_bytes().to_vec())),
+        ),
+        (Bytes::from_static(b"modules"), RespValue::array(vec![])),
+    ];
+    if proto == 3 {
+        return RespValue::map(
+            fields
+                .into_iter()
+                .map(|(k, v)| (RespValue::bulk(k), v))
+                .collect(),
+        );
+    }
+    let mut flat = Vec::with_capacity(fields.len() * 2);
+    for (k, v) in fields {
+        flat.push(RespValue::bulk(k));
+        flat.push(v);
+    }
+    RespValue::array(flat)
+}
+
+fn next_conn_id() -> i64 {
+    static NEXT: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Conn-layer `REPLICAOF host port` / `REPLICAOF NO ONE`.
@@ -349,6 +532,81 @@ fn replicaof_command(
     g.role = Role::Replica;
     g.replicaof = Some((host, port));
     RespValue::ok()
+}
+
+/// Complete an INFO reply: fill the memory limit fields, add the
+/// persistence/security sections, and honour `INFO <section>` selection.
+fn finish_info(
+    resp: RespValue,
+    args: &[Bytes],
+    rt: &Arc<ShardRuntime>,
+    runtime: &Arc<RwLock<ConfigRuntime>>,
+    pctx: &Option<PersistenceCtx>,
+) -> RespValue {
+    let RespValue::BulkString(Some(text)) = resp else {
+        return resp;
+    };
+    let body = String::from_utf8_lossy(&text).to_string();
+    // (lowercase key for lookup, header as emitted, lines)
+    let mut sections: Vec<(String, String, Vec<String>)> = Vec::new();
+    for line in body.lines() {
+        let line = line.trim_end_matches('\r');
+        if let Some(name) = line.strip_prefix('#') {
+            let name = name.trim();
+            sections.push((name.to_ascii_lowercase(), name.to_string(), Vec::new()));
+        } else if !line.is_empty() {
+            if let Some(last) = sections.last_mut() {
+                last.2.push(line.to_string());
+            }
+        }
+    }
+    let (maxmemory, policy) = jx_engine::coordinator::memory_limits(rt);
+    if let Some(mem) = sections.iter_mut().find(|(n, _, _)| n == "memory") {
+        mem.2.push(format!("maxmemory:{maxmemory}"));
+        mem.2.push(format!("maxmemory_policy:{policy}"));
+    }
+    let (appendonly, requirepass_set, tls_mode) = {
+        let g = runtime.read().unwrap();
+        (g.appendonly, g.requirepass_sm3.is_some(), g.tls_mode)
+    };
+    sections.push((
+        "persistence".to_string(),
+        "Persistence".to_string(),
+        jx_engine::stats::info_persistence_section(appendonly, pctx.is_some()),
+    ));
+    sections.push((
+        "security".to_string(),
+        "Security".to_string(),
+        vec![
+            format!("tls_mode:{}", tls_mode_name(tls_mode)),
+            format!("requirepass_set:{}", u8::from(requirepass_set)),
+        ],
+    ));
+
+    let want = args
+        .get(1)
+        .map(|s| String::from_utf8_lossy(s).trim().to_ascii_lowercase());
+    let keep: Vec<(String, String, Vec<String>)> = match want.as_deref() {
+        None | Some("") | Some("all") | Some("default") | Some("everything") => sections,
+        Some(name) => sections.into_iter().filter(|(n, _, _)| n == name).collect(),
+    };
+    let mut out = String::new();
+    for (_, header, lines) in keep {
+        out.push_str(&format!("# {header}\r\n"));
+        for line in lines {
+            out.push_str(&line);
+            out.push_str("\r\n");
+        }
+    }
+    RespValue::bulk(Bytes::from(out))
+}
+
+fn tls_mode_name(mode: TlsMode) -> &'static str {
+    match mode {
+        TlsMode::Plain => "plain",
+        TlsMode::Tls => "tls",
+        TlsMode::Tlcp => "tlcp",
+    }
 }
 
 /// Append the `# Replication` section to engine INFO text.
@@ -434,6 +692,14 @@ fn config_command(
                     };
                     config_pair(&param, &v)
                 }
+                "slowlog-log-slower-than" => {
+                    let v = runtime.read().unwrap().slowlog_log_slower_than.to_string();
+                    config_pair(&param, &v)
+                }
+                "slowlog-max-len" => {
+                    let v = runtime.read().unwrap().slowlog_max_len.to_string();
+                    config_pair(&param, &v)
+                }
                 other => RespValue::err(format!("ERR unsupported CONFIG parameter '{other}'")),
             }
         }
@@ -464,6 +730,36 @@ fn config_command(
                     runtime.write().unwrap().requirepass_sm3 = h;
                     RespValue::ok()
                 }
+                "slowlog-log-slower-than" => match val.parse::<i64>() {
+                    Ok(n) => {
+                        let (max_len, sl) = {
+                            let mut g = runtime.write().unwrap();
+                            g.slowlog_log_slower_than = n;
+                            (g.slowlog_max_len, g.slowlog.clone())
+                        };
+                        sl.set_config(crate::slowlog::SlowlogConfig {
+                            log_slower_than: n,
+                            max_len,
+                        });
+                        RespValue::ok()
+                    }
+                    Err(_) => RespValue::err("ERR value is not an integer or out of range"),
+                },
+                "slowlog-max-len" => match val.parse::<usize>() {
+                    Ok(n) => {
+                        let (log_slower_than, sl) = {
+                            let mut g = runtime.write().unwrap();
+                            g.slowlog_max_len = n;
+                            (g.slowlog_log_slower_than, g.slowlog.clone())
+                        };
+                        sl.set_config(crate::slowlog::SlowlogConfig {
+                            log_slower_than,
+                            max_len: n,
+                        });
+                        RespValue::ok()
+                    }
+                    Err(_) => RespValue::err("ERR value is not an integer or out of range"),
+                },
                 other => RespValue::err(format!("ERR unsupported CONFIG parameter '{other}'")),
             }
         }

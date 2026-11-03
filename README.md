@@ -12,6 +12,7 @@ MemoryDataBase (江湘) is a Rust-based, signal-processing-aware cache middlewar
 - **Memory Management & Eviction**: `maxmemory` with policies `noeviction`, `allkeys-lru`, `volatile-lru`, `allkeys-lfu`, `volatile-lfu`, `volatile-ttl`. Lazy expiration + periodic active cleanup (100ms budgeted).
 - **Backpressure & Safety**: Bounded per-shard command queues; on saturation returns `ERR shard command queue full` with lightweight conn pause. Actor crash triggers fail-fast process exit; recovery failures refuse startup.
 - **Observability**: Structured logging, INFO sections (server/memory/persistence/stats/replication/cpu/security), metrics counters (evictions, expirations, queue depth, AOF flush latency), SLOWLOG and CLIENT subcommands (minimal).
+- **RESP3 handshake compatibility**: `HELLO` is supported (versions 2 and 3). Clients that negotiate protocol 3 get RESP3-shaped replies (map replies, `_` nulls, WITHSCORES pairs) for that connection; RESP2 clients keep the classic encodings.
 - **Cross-Platform (信创)**: Targets x86_64, aarch64 (ARM64), loongarch64. Validated against mainstream domestic OS baselines (Kylin/UOS/openEuler/Anolis).
 
 ## Architecture Overview
